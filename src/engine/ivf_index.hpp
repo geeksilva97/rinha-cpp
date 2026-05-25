@@ -47,6 +47,17 @@ struct IvfIndex {
   const uint8_t  *labels    = nullptr;
 };
 
+// Float-domain dist². Used at training time on raw vectors before
+// quantization. Runtime queries use the int16 version below.
+static inline float dist_sq(const float *a, const float *b) {
+  float d = 0;
+  for (uint32_t i = 0; i < DIM; ++i) {
+    float diff = a[i] - b[i];
+    d += diff * diff;
+  }
+  return d;
+}
+
 static inline int64_t dist_sq(const int16_t *a, const int16_t *b) {
 #if IVF_HAS_AVX2
   __m256i va = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(a));

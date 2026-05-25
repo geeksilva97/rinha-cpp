@@ -15,8 +15,6 @@ struct Engine {
   int nprobe      = 70;
   int fast_nprobe = 5;
 
-  // Adaptive-nprobe instrumentation. Bucketed by the fast-pass result so
-  // we can see which counts trigger escalation most.
   mutable std::atomic<uint64_t> total{0};
   mutable std::atomic<uint64_t> escalated{0};
   mutable std::atomic<uint64_t> fast_hist[6]{};
@@ -42,6 +40,9 @@ struct Engine {
 
     int fc = ivf::ivf_fraud_count(idx, q16, fast_nprobe);
     fast_hist[fc < 0 ? 0 : (fc > 5 ? 5 : fc)].fetch_add(1, std::memory_order_relaxed);
+    // Escalate any non-consensus count. Unanimous (0 or TOP_K) is
+    // trusted; only those are escalated when the IVF clustering is
+    // suspect — see notes in docs/results.md.
     if (fc > 0 && fc < ivf::TOP_K) {
       fc = ivf::ivf_fraud_count(idx, q16, nprobe);
       escalated.fetch_add(1, std::memory_order_relaxed);

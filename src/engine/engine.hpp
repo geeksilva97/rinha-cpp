@@ -5,6 +5,7 @@
 
 #include "ivf_index.hpp"
 #include "parser.hpp"
+#include <atomic>
 #include <cstdint>
 
 namespace rinha {
@@ -13,6 +14,12 @@ struct Engine {
   ivf::IvfIndex idx;
   int nprobe      = 70;
   int fast_nprobe = 5;
+
+  // Adaptive-nprobe instrumentation. Bucketed by the fast-pass result so
+  // we can see which counts trigger escalation most.
+  mutable std::atomic<uint64_t> total{0};
+  mutable std::atomic<uint64_t> escalated{0};
+  mutable std::atomic<uint64_t> fast_hist[6]{};
 
   bool load(const char *path) { return ivf::load_index(path, idx); }
   void unload() { ivf::unload_index(idx); }
@@ -24,14 +31,21 @@ struct Engine {
     alignas(32) int16_t q16[ivf::STRIDE];
     ivf::quantize_query(qf, idx.scale, q16);
 
-    if (fast_nprobe >= nprobe)
-      return ivf::ivf_fraud_count(idx, q16, nprobe);
+    total.fetch_add(1, std::memory_order_relaxed);
+
+    if (fast_nprobe >= nprobe) {
+      int fc = ivf::ivf_fraud_count(idx, q16, nprobe);
+      escalated.fetch_add(1, std::memory_order_relaxed);
+      fast_hist[fc < 0 ? 0 : (fc > 5 ? 5 : fc)].fetch_add(1, std::memory_order_relaxed);
+      return fc;
+    }
 
     int fc = ivf::ivf_fraud_count(idx, q16, fast_nprobe);
-    // Escalate any non-consensus count (not 0 and not 5) — wider band
-    // than the Ruby version's {2,3} to eliminate borderline misses.
-    if (fc > 0 && fc < ivf::TOP_K)
+    fast_hist[fc < 0 ? 0 : (fc > 5 ? 5 : fc)].fetch_add(1, std::memory_order_relaxed);
+    if (fc > 0 && fc < ivf::TOP_K) {
       fc = ivf::ivf_fraud_count(idx, q16, nprobe);
+      escalated.fetch_add(1, std::memory_order_relaxed);
+    }
     return fc;
   }
 };

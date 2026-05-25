@@ -209,6 +209,25 @@ static int handle_readable(Conn *c, int epfd) {
       int fc = g_engine.fraud_count(c->buf + hdr_bytes, cl);
       if (fc < 0) fc = 0; else if (fc > 5) fc = 5;
       rc = send_response(c, RESPONSES[fc], RESPONSES_LEN[fc], epfd);
+    } else if (mlen == 3 && method[0] == 'G' && plen == 6 &&
+               std::memcmp(path, "/stats", 6) == 0) {
+      static char stats_buf[512];
+      uint64_t tot  = g_engine.total.load(std::memory_order_relaxed);
+      uint64_t esc  = g_engine.escalated.load(std::memory_order_relaxed);
+      uint64_t h[6];
+      for (int j = 0; j < 6; ++j) h[j] = g_engine.fast_hist[j].load(std::memory_order_relaxed);
+      char body[400];
+      int bn = std::snprintf(body, sizeof(body),
+        "{\"total\":%lu,\"escalated\":%lu,\"escalation_pct\":%.2f,"
+        "\"fast_hist\":[%lu,%lu,%lu,%lu,%lu,%lu]}",
+        tot, esc, tot ? (100.0 * esc / tot) : 0.0,
+        h[0], h[1], h[2], h[3], h[4], h[5]);
+      int n = std::snprintf(stats_buf, sizeof(stats_buf),
+        "HTTP/1.1 200 OK\r\n"
+        "content-type: application/json\r\n"
+        "content-length: %d\r\n"
+        "\r\n%s", bn, body);
+      rc = send_response(c, stats_buf, n, epfd);
     } else {
       rc = send_response(c, NOT_FOUND_RESP, NOT_FOUND_LEN, epfd);
     }

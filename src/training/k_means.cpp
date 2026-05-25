@@ -1,113 +1,188 @@
-#include "../engine/ivf_index.hpp"  // ivf::dist_sq (SIMD when available)
+// k-means trainer with pause/resume.
+//
+// After every iter the float-precision centroids are atomically
+// written to `centroids.f32.bin`. On startup we look for that file;
+// if present, training resumes from those centroids instead of doing
+// a random k-init. SIGINT / SIGTERM finish the current iter and exit
+// cleanly so we always leave a consistent checkpoint behind.
+//
+// This binary does NOT write the deployable `ivf.bin` — that step
+// (quantize + assign + serialize the whole partitioned dataset) lives
+// in `build_ivf`, which reads the same checkpoint and produces the
+// final blob in ~30 seconds. Keep training tight; defer the heavy
+// I/O to the moment you actually want a snapshot.
+
+#include "../engine/ivf_index.hpp"
 #include "json.hpp"
+
+#include <atomic>
 #include <bit>
 #include <chrono>
 #include <cmath>
+#include <cstring>
+#include <csignal>
 #include <fstream>
 #include <iostream>
 #include <random>
+#include <sys/stat.h>
 
 static_assert(std::endian::native == std::endian::little,
               "this code assumes little-endian");
 
-using namespace std;
+using std::cerr;
+using std::cout;
 using json = nlohmann::json;
 using ivf::dist_sq;
 
-std::mt19937 rng(42); // seed
+namespace {
 
-// K is overridable via CLI for retraining experiments (e.g. K=4096).
-// Default 1700 matches the originally shipped ivf.bin.
+std::mt19937 rng(42);
+
 uint32_t K = 1700;
-// T = 200 is a hard cap — well above any plausible convergence horizon.
-// We rely on EPS_MOVE for the actual stopping condition. The previous
-// training (T=20, EPS_MOVE=1e-4) had no logs, so we have no record of
-// whether it actually converged or just timed out at 20 epochs.
 constexpr uint32_t T = 200;
 constexpr uint32_t DIM = 14;
-// Tighter convergence: per-centroid avg movement well below the int16
-// quantization step (1/16383 ≈ 6e-5) means quantizing more won't change
-// the resulting ivf.bin meaningfully.
+// Tighter than the int16 quantization step (1/16383 ≈ 6e-5). Below
+// this further iters are just shuffling borderline points.
 constexpr float    EPS_MOVE = 1e-6f;
+
+constexpr const char *CHECKPOINT_PATH = "centroids.f32.bin";
+
+std::atomic<bool> g_stop{false};
+
+void handle_signal(int) { g_stop.store(true, std::memory_order_relaxed); }
+
+bool file_exists(const char *p) {
+  struct stat st;
+  return stat(p, &st) == 0;
+}
+
+// Checkpoint layout: 16-byte header (K, DIM, completed_iter, reserved)
+// followed by K * DIM float32 centroids. Atomic via rename.
+bool write_checkpoint(const std::vector<std::vector<float>> &centroids,
+                      uint32_t completed_iter) {
+  std::string tmp = std::string(CHECKPOINT_PATH) + ".tmp";
+  std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+  if (!out) { cerr << "checkpoint: open failed\n"; return false; }
+  uint32_t k = static_cast<uint32_t>(centroids.size());
+  uint32_t d = DIM;
+  uint32_t reserved = 0;
+  out.write(reinterpret_cast<const char *>(&k), 4);
+  out.write(reinterpret_cast<const char *>(&d), 4);
+  out.write(reinterpret_cast<const char *>(&completed_iter), 4);
+  out.write(reinterpret_cast<const char *>(&reserved), 4);
+  for (auto &c : centroids)
+    out.write(reinterpret_cast<const char *>(c.data()), DIM * sizeof(float));
+  out.close();
+  if (std::rename(tmp.c_str(), CHECKPOINT_PATH) != 0) {
+    cerr << "checkpoint: rename failed\n"; return false;
+  }
+  return true;
+}
+
+bool load_checkpoint(std::vector<std::vector<float>> &centroids,
+                     uint32_t &completed_iter) {
+  std::ifstream in(CHECKPOINT_PATH, std::ios::binary);
+  if (!in) return false;
+  uint32_t k, d, ci, rsv;
+  in.read(reinterpret_cast<char *>(&k),  4);
+  in.read(reinterpret_cast<char *>(&d),  4);
+  in.read(reinterpret_cast<char *>(&ci), 4);
+  in.read(reinterpret_cast<char *>(&rsv), 4);
+  if (d != DIM) { cerr << "checkpoint DIM=" << d << " != " << DIM << "\n"; return false; }
+  K = k;
+  centroids.assign(k, std::vector<float>(DIM, 0.0f));
+  for (uint32_t i = 0; i < k; ++i)
+    in.read(reinterpret_cast<char *>(centroids[i].data()), DIM * sizeof(float));
+  completed_iter = ci;
+  return true;
+}
+
+} // namespace
 
 int main(int argc, char *argv[]) {
   if (argc < 2) {
-    std::cerr << "uso: " << argv[0] << " <references.json> [K]\n";
+    cerr << "usage: " << argv[0] << " <references.json> [K]\n";
     return 1;
   }
-
-  std::string path = argv[1];
   if (argc >= 3) K = static_cast<uint32_t>(std::atoi(argv[2]));
-  std::ifstream f(path);
+
+  std::signal(SIGINT,  handle_signal);
+  std::signal(SIGTERM, handle_signal);
+
+  cerr << "reading " << argv[1] << "...\n";
+  std::ifstream f(argv[1]);
   json data = json::parse(f);
   std::vector<std::vector<float>> points;
-  std::vector<uint8_t> labels;
   points.reserve(data.size());
-  labels.reserve(data.size());
-  for (auto &item : data) {
-    points.push_back(item["vector"]);
-    labels.push_back(item["label"] == "fraud" ? 1 : 0);
+  for (auto &item : data) points.push_back(item["vector"]);
+  cerr << "N=" << points.size() << "\n";
+
+  std::vector<size_t> assignments(points.size());
+  std::vector<std::vector<float>> centroids;
+  uint32_t start_iter = 0;
+
+  if (file_exists(CHECKPOINT_PATH)) {
+    if (load_checkpoint(centroids, start_iter)) {
+      cerr << "resuming from " << CHECKPOINT_PATH
+           << " (K=" << K << ", completed_iter=" << start_iter << ")\n";
+    } else {
+      cerr << "checkpoint exists but failed to load — aborting to avoid\n"
+              "silently re-initializing. Move or delete it.\n";
+      return 1;
+    }
+  } else {
+    centroids.assign(K, std::vector<float>(DIM, 0.0f));
+    std::sample(points.begin(), points.end(), centroids.begin(), K, rng);
+    cerr << "fresh init via std::sample (K=" << K << ")\n";
   }
 
-  std::vector<size_t> assignments(data.size());
-  std::vector<std::vector<float>> centroids(K);
-  std::sample(points.begin(), points.end(), centroids.begin(), K, rng);
-  std::vector<std::vector<float>> prev_centroids(K, std::vector<float>(DIM, 0.0f));
+  std::vector<std::vector<float>> prev(K, std::vector<float>(DIM, 0.0f));
   std::vector<std::vector<float>> sum(K, std::vector<float>(DIM, 0.0f));
   std::vector<int> count(K, 0);
 
   using clock = std::chrono::steady_clock;
   auto t_start = clock::now();
-
   cout << "training k-means: K=" << K << " T=" << T << " DIM=" << DIM
-       << " N=" << data.size() << "\n";
+       << " N=" << points.size() << " resume_from=" << start_iter
+       << " eps=" << EPS_MOVE << "\n";
 
-  for (uint32_t t = 0; t < T; ++t) {
+  for (uint32_t t = start_iter; t < T; ++t) {
+    if (g_stop.load(std::memory_order_relaxed)) {
+      cout << "stop signal received at start of iter " << (t+1) << "\n";
+      break;
+    }
     auto iter_start = clock::now();
+    for (uint32_t j = 0; j < K; ++j) prev[j] = centroids[j];
 
-    // snapshot centroids before this iteration's update (for convergence check)
-    for (uint32_t j = 0; j < K; ++j) prev_centroids[j] = centroids[j];
-
-    // ASSIGN (hot loop: N × K × D ops; dist_sq uses SIMD when available)
-    for (size_t i = 0; i < data.size(); ++i) {
+    // ASSIGN
+    for (size_t i = 0; i < points.size(); ++i) {
       float best_dist = std::numeric_limits<float>::max();
       int best_j = 0;
       const float *xi = points[i].data();
-
       for (uint32_t j = 0; j < K; ++j) {
-        float dist = dist_sq(xi, centroids[j].data());
-        if (dist < best_dist) {
-          best_dist = dist;
-          best_j = j;
-        }
+        float d = dist_sq(xi, centroids[j].data());
+        if (d < best_dist) { best_dist = d; best_j = j; }
       }
-
       assignments[i] = best_j;
     }
 
     // UPDATE
     std::fill(count.begin(), count.end(), 0);
-    for (auto &s : sum)
-      std::fill(s.begin(), s.end(), 0.0f);
-    for (size_t i = 0; i < data.size(); ++i) {
+    for (auto &s : sum) std::fill(s.begin(), s.end(), 0.0f);
+    for (size_t i = 0; i < points.size(); ++i) {
       int c = assignments[i];
-      for (uint32_t d = 0; d < DIM; ++d)
-        sum[c][d] += points[i][d];
+      for (uint32_t d = 0; d < DIM; ++d) sum[c][d] += points[i][d];
       count[c]++;
     }
-
     for (uint32_t j = 0; j < K; ++j) {
-      if (count[j] == 0) continue; // orphan centroid
-      for (uint32_t d = 0; d < DIM; ++d) {
-        centroids[j][d] = sum[j][d] / count[j];
-      }
+      if (count[j] == 0) continue;
+      for (uint32_t d = 0; d < DIM; ++d) centroids[j][d] = sum[j][d] / count[j];
     }
 
-    // total L2 movement of centroids vs previous iteration
+    // movement
     float move = 0.0f;
-    for (uint32_t j = 0; j < K; ++j) {
-      move += std::sqrt(dist_sq(centroids[j].data(), prev_centroids[j].data()));
-    }
+    for (uint32_t j = 0; j < K; ++j)
+      move += std::sqrt(dist_sq(centroids[j].data(), prev[j].data()));
 
     auto iter_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
         clock::now() - iter_start).count();
@@ -118,101 +193,17 @@ int main(int argc, char *argv[]) {
          << "  total=" << total_s << "s"
          << "  move=" << move << "\n" << std::flush;
 
+    if (!write_checkpoint(centroids, t + 1))
+      cerr << "  (warning: checkpoint write failed)\n";
+
     if (move < EPS_MOVE) {
-      cout << "converged at iter " << (t + 1) << " (move=" << move
-           << " < eps=" << EPS_MOVE << ")\n";
+      cout << "converged at iter " << (t + 1)
+           << " (move=" << move << " < eps=" << EPS_MOVE << ")\n";
       break;
     }
   }
 
-  // ── int16 quantization ─────────────────────────────────────────────
-  // Vectors are normalized (most dims in [-1,1] or [0,1]; one in [0,0.05]).
-  // Find a single global scale that maps the largest-magnitude dim to the
-  // full int16 range. dist² ordering is preserved (linear transform).
-  float global_abs_max = 0.0f;
-  for (const auto &p : points)
-    for (uint32_t d = 0; d < DIM; ++d)
-      global_abs_max = std::max(global_abs_max, std::abs(p[d]));
-  for (const auto &c : centroids)
-    for (uint32_t d = 0; d < DIM; ++d)
-      global_abs_max = std::max(global_abs_max, std::abs(c[d]));
-
-  // Use 16383 (= INT16_MAX/2) so that max_diff = 2*16383 = 32766 stays
-  // within int16. Otherwise `_mm256_sub_epi16` wraps and `_mm256_madd_epi16`
-  // computes garbage on (q_a - q_b) for extreme pairs.
-  // Also keeps sum-of-2-squares per madd lane within int32: 2 * 32766² ≈ 2.147e9 < INT32_MAX.
-  const float scale = (global_abs_max > 0.0f) ? (16383.0f / global_abs_max) : 1.0f;
-  cout << "quant: global_abs_max=" << global_abs_max << " scale=" << scale
-       << " (capped at 16383 to keep diff within int16)" << endl;
-
-  auto qz = [scale](float v) -> int16_t {
-    float q = std::round(v * scale);
-    if (q >  16383.0f) q =  16383.0f;
-    if (q < -16383.0f) q = -16383.0f;
-    return static_cast<int16_t>(q);
-  };
-
-  // Storage stride: pad DIM=14 → 16 so each vector is one 32-byte AVX2 reg.
-  // Last two int16 slots are zeroed; they contribute 0 to (a-b)² and
-  // disappear from the SIMD dist_sq automatically.
-  constexpr uint32_t STRIDE = 16;
-
-  // save file
-  ofstream out("ivf.bin", ios::binary);
-  if (!out) { cerr << "Error while opening the file for writing"; return 1; }
-
-  uint32_t N = static_cast<uint32_t>(data.size());
-
-  // HEADER (16 bytes: K, D, N, scale)
-  out.write(reinterpret_cast<const char *>(&K),      sizeof(K));
-  out.write(reinterpret_cast<const char *>(&DIM),    sizeof(DIM));
-  out.write(reinterpret_cast<const char *>(&N),      sizeof(N));
-  out.write(reinterpret_cast<const char *>(&scale),  sizeof(scale));   // NEW
-  // (STRIDE=16 is implicit from DIM=14 → next power of 2 with ≥DIM lanes
-  // for AVX2 alignment. Reader hardcodes it.)
-
-  // CENTROIDS (K × STRIDE × int16)
-  {
-    std::vector<int16_t> buf(STRIDE, 0);
-    for (const auto &centroid : centroids) {
-      for (uint32_t d = 0; d < DIM; ++d) buf[d] = qz(centroid[d]);
-      // STRIDE-DIM tail stays 0
-      out.write(reinterpret_cast<const char *>(buf.data()),
-                STRIDE * sizeof(int16_t));
-    }
-  }
-
-  // OFFSETS (prefix-sum dos counts)
-  std::vector<uint32_t> offsets(K + 1);
-  offsets[0] = 0;
-  for (uint32_t j = 0; j < K; ++j) offsets[j + 1] = offsets[j] + count[j];
-  out.write(reinterpret_cast<const char *>(offsets.data()),
-            offsets.size() * sizeof(uint32_t));
-
-  // VECTORS sorted by cluster (using cursor array), STRIDE int16 each
-  auto cursor = offsets;
-  std::vector<int16_t> ordered_vectors(N * STRIDE, 0); // zero-init for tail
-  std::vector<uint8_t> ordered_labels(N);
-
-  for (uint32_t i = 0; i < N; ++i) {
-    uint32_t cluster_index = assignments[i];
-    uint32_t pos = cursor[cluster_index]++;
-    for (uint32_t d = 0; d < DIM; ++d)
-      ordered_vectors[pos * STRIDE + d] = qz(points[i][d]);
-    // tail (d = DIM..STRIDE-1) already 0
-    ordered_labels[pos] = labels[i];
-  }
-
-  out.write(reinterpret_cast<const char *>(ordered_vectors.data()),
-            ordered_vectors.size() * sizeof(int16_t));
-
-  // LABELS
-  out.write(reinterpret_cast<const char *>(ordered_labels.data()),
-            ordered_labels.size() * sizeof(uint8_t));
-
-  out.close();
-  cout << "wrote ivf.bin: K=" << K << " D=" << DIM << " STRIDE=" << STRIDE
-       << " N=" << N << " scale=" << scale << endl;
-
+  cout << "done. checkpoint at " << CHECKPOINT_PATH
+       << ". run `build_ivf <references.json>` to produce ivf.bin.\n";
   return 0;
 }

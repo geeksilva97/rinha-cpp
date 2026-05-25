@@ -13,7 +13,7 @@ BIN_DIR  ?= build
 
 .PHONY: all clean api lb
 
-all: $(BIN_DIR)/api $(BIN_DIR)/lb $(BIN_DIR)/eval $(BIN_DIR)/k_means
+all: $(BIN_DIR)/api $(BIN_DIR)/lb $(BIN_DIR)/eval $(BIN_DIR)/k_means $(BIN_DIR)/build_ivf
 
 $(BIN_DIR):
 	mkdir -p $(BIN_DIR)
@@ -29,6 +29,9 @@ $(BIN_DIR)/eval: src/tools/eval.cpp src/engine/engine.hpp src/engine/ivf_index.h
 
 # Training builds with -march=native (offline, runs on the build host).
 $(BIN_DIR)/k_means: src/training/k_means.cpp src/engine/ivf_index.hpp | $(BIN_DIR)
+	$(CXX) -O3 -std=c++20 -march=native -mtune=native $(if $(filter $(CXX),g++ c++),-Wall,) $< -o $@
+
+$(BIN_DIR)/build_ivf: src/training/build_ivf.cpp src/engine/ivf_index.hpp | $(BIN_DIR)
 	$(CXX) -O3 -std=c++20 -march=native -mtune=native $(if $(filter $(CXX),g++ c++),-Wall,) $< -o $@
 
 api: $(BIN_DIR)/api

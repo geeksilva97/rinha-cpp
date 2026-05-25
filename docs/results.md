@@ -47,3 +47,41 @@ Total possible: 6000. Distance to ceiling: ~335 points, split into:
   1300 p99 points — net very negative. The 2 errors look intrinsic
   to the IVF labels at the 0.6 threshold; reaching them likely
   requires retraining or a small re-ranker.
+
+## Retraining experiment
+
+The original `ivf.bin` was trained with k-means at `T=20` epochs with
+no record of the final `move` value. We retrained from scratch with
+`T=200` and `EPS_MOVE=1e-6` to see whether the older index was
+undertrained and whether better-converged clusters would fix the two
+remaining errors.
+
+The training did converge much more tightly: `move` at iter 20 was
+~3.6 (where the old training stopped); at iter 200 it had dropped to
+**0.115** — about 30× tighter. But the resulting index performed
+slightly *worse* on the test set:
+
+| index            | training | fp | fn | total errors |
+|------------------|---------:|---:|---:|-------------:|
+| `ivf.bin`        | T=20     |  1 |  1 |  2 |
+| `ivf.bin` (new)  | T=200    |  2 |  1 |  3 |
+
+Why retraining didn't help: the eval tool runs a brute-force top-5
+across all 3 M reference vectors for the disagreement cases. For
+both the original FP1 and the original FN1, brute-force returns the
+*same* count as full-nprobe — meaning the L2-nearest training points
+in 14-dim feature space simply disagree with the test labels. Better
+clustering reshuffles which points are picked at any given nprobe,
+but it can't change *which training points are closest*. One of
+the new clusterings happened to push a borderline previously-correct
+case into the wrong fast/full bucket, adding FP2.
+
+Conclusion: **keep the T=20 ivf.bin**. The remaining two errors are at
+the feature-engineering level, not the index level. Fixing them would
+require either a richer feature vector or a post-classifier on top of
+the kNN votes — neither is in scope for this submission.
+
+The training infrastructure (`src/training/k_means.cpp` with
+pause/resume + `src/training/build_ivf.cpp` to materialize a
+checkpoint into `ivf.bin`) stays in the repo for future re-training
+work.

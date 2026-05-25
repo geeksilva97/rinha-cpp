@@ -39,6 +39,18 @@ path). Keep-alive supported.
   the cheap result is non-consensus (would otherwise flip the
   decision).
 
+## Results
+
+On a GCP VM matching the rinha-2026 reference machine
+(Haswell, 4 vCPU, 8 GB), k6 ramping-arrival-rate to 900 RPS:
+
+| stack              | final score | p99      | fp | fn |
+|--------------------|------------:|---------:|---:|---:|
+| Ruby + C ext + nginx | 4 362.78  | 18.88 ms |  6 |  3 |
+| **rinha-cpp (this repo)** | **5 664.5** | **1.34 ms** | **1** | **1** |
+
+Detailed sweep + score decomposition in [`docs/results.md`](docs/results.md).
+
 ## Build & run
 
 ```sh

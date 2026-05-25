@@ -1,0 +1,76 @@
+# rinha-de-backend-2026 submission for geeksilva97-cpp.
+# Image built from https://github.com/geeksilva97/rinha-cpp main @ 84085e0.
+#
+# Total budget: 1.0 CPU + 350 MB. Split: lb 0.10/20MB, api1 0.45/165MB, api2 0.45/165MB.
+# Both api containers share the same image so the IVF index is one inode → one
+# shared page-cache copy across processes.
+services:
+  api1: &api
+    image: docker.io/codesilva/rinha-cpp@sha256:356e9103ecc0dd5baf1c0aabb3b87803145e954bc8b4e7223994fe5f421206c2
+    platform: linux/amd64
+    restart: always
+    command: ["/usr/local/bin/api"]
+    environment:
+      - CTRL=/run/sock/api1.ctrl
+      - IVF_PATH=/data/ivf.bin
+      - NPROBE=70
+      - FAST_NPROBE=5
+      - WARMUP_PATH=/data/example-payloads.json
+      - WARMUP_ROUNDS=10
+    volumes:
+      - sock:/run/sock
+    healthcheck:
+      test: ["CMD-SHELL", "test -S /run/sock/api1.ctrl"]
+      interval: 1s
+      timeout: 1s
+      retries: 120
+      start_period: 3s
+    deploy:
+      resources:
+        limits:
+          cpus: "0.45"
+          memory: "165M"
+
+  api2:
+    <<: *api
+    environment:
+      - CTRL=/run/sock/api2.ctrl
+      - IVF_PATH=/data/ivf.bin
+      - NPROBE=70
+      - FAST_NPROBE=5
+      - WARMUP_PATH=/data/example-payloads.json
+      - WARMUP_ROUNDS=10
+    healthcheck:
+      test: ["CMD-SHELL", "test -S /run/sock/api2.ctrl"]
+      interval: 1s
+      timeout: 1s
+      retries: 120
+      start_period: 3s
+
+  lb:
+    image: docker.io/codesilva/rinha-cpp@sha256:356e9103ecc0dd5baf1c0aabb3b87803145e954bc8b4e7223994fe5f421206c2
+    platform: linux/amd64
+    restart: always
+    depends_on:
+      api1: { condition: service_healthy }
+      api2: { condition: service_healthy }
+    command: ["/usr/local/bin/lb"]
+    environment:
+      - UPSTREAMS=/run/sock/api1.ctrl,/run/sock/api2.ctrl
+      - PORT=9999
+    volumes:
+      - sock:/run/sock
+    ports:
+      - "9999:9999"
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+    deploy:
+      resources:
+        limits:
+          cpus: "0.10"
+          memory: "20M"
+
+volumes:
+  sock:

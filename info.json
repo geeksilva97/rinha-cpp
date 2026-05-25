@@ -1,0 +1,7 @@
+{
+  "participants": ["Edy Silva"],
+  "social": ["https://github.com/geeksilva97"],
+  "source-code-repo": "https://github.com/geeksilva97/rinha-cpp",
+  "stack": ["c++", "epoll", "scm_rights", "ivf", "simd", "avx2"],
+  "open_to_work": false
+}

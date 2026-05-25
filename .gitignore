@@ -3,3 +3,8 @@ build/
 stress/test-data.json
 stress/results-*.json
 .DS_Store
+
+# Local training workspace (artifacts, not source). The training source
+# lives in src/training/; the deployable index lives in resources/ivf.bin.gz.
+training/
+lab/

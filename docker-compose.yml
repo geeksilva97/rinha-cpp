@@ -1,0 +1,84 @@
+# Total budget: 1.0 CPU + 350 MB (per rinha rules).
+#
+# Split:
+#   lb   → 0.10 CPU /  20 MB  (fd-passing only, near-idle CPU)
+#   api1 → 0.45 CPU / 165 MB  (HTTP + IVF query)
+#   api2 → 0.45 CPU / 165 MB
+#
+# ivf.bin (~99 MB) is shipped inside the image. Both api containers run
+# off the same image layer → same underlying file inode → kernel shares
+# page-cache pages for the mmap'd index across both processes.
+services:
+  api1: &api
+    image: rinha-cpp:latest
+    build:
+      context: .
+      args:
+        CXX_MARCH: ${CXX_MARCH:-haswell}
+    platform: linux/amd64
+    restart: always
+    environment:
+      - CTRL=/run/sock/api1.ctrl
+      - IVF_PATH=/data/ivf.bin
+      - NPROBE=${NPROBE:-70}
+      - FAST_NPROBE=${FAST_NPROBE:-5}
+      - WARMUP_PATH=/data/example-payloads.json
+      - WARMUP_ROUNDS=${WARMUP_ROUNDS:-10}
+    command: ["/usr/local/bin/api"]
+    volumes:
+      - sock:/run/sock
+    healthcheck:
+      test: ["CMD-SHELL", "test -S /run/sock/api1.ctrl"]
+      interval: 1s
+      timeout: 1s
+      retries: 120
+      start_period: 3s
+    deploy:
+      resources:
+        limits:
+          cpus: "0.45"
+          memory: "165M"
+
+  api2:
+    <<: *api
+    environment:
+      - CTRL=/run/sock/api2.ctrl
+      - IVF_PATH=/data/ivf.bin
+      - NPROBE=${NPROBE:-70}
+      - FAST_NPROBE=${FAST_NPROBE:-5}
+      - WARMUP_PATH=/data/example-payloads.json
+      - WARMUP_ROUNDS=${WARMUP_ROUNDS:-10}
+    healthcheck:
+      test: ["CMD-SHELL", "test -S /run/sock/api2.ctrl"]
+      interval: 1s
+      timeout: 1s
+      retries: 120
+      start_period: 3s
+
+  lb:
+    image: rinha-cpp:latest
+    platform: linux/amd64
+    restart: always
+    depends_on:
+      api1: { condition: service_healthy }
+      api2: { condition: service_healthy }
+    environment:
+      - UPSTREAMS=/run/sock/api1.ctrl,/run/sock/api2.ctrl
+      - PORT=9999
+    command: ["/usr/local/bin/lb"]
+    volumes:
+      - sock:/run/sock
+    ports:
+      - "9999:9999"
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+    deploy:
+      resources:
+        limits:
+          cpus: "0.10"
+          memory: "20M"
+
+volumes:
+  sock:

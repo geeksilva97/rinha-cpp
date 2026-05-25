@@ -1,0 +1,6 @@
+build/
+.git/
+.claude/
+docs/
+stress/results*
+*.log

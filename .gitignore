@@ -1,0 +1,5 @@
+build/
+*.o
+stress/test-data.json
+stress/results-*.json
+.DS_Store
